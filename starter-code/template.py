@@ -1,16 +1,17 @@
 """
-Lab #4: System Prompt Engineering & Tool Calling Engine
+Lab #4: System Prompt Engineering & Tool Calling Engine (Production Grade)
 Học viên hoàn thiện các mục TODO để hoàn thành bài lab.
 
 Kiến trúc:
   - ChatbotBaseline: LLM thuần, không dùng tool → quan sát hallucination.
-  - ToolCallingAgent: Agent dùng System Prompt + 2 Tool Schemas.
+  - ToolCallingAgent: Agent dùng System Prompt + Tool Calling Engine (Hỗ trợ cả Mock ReAct Loop và Live Gemini API).
 """
 
 import json
 import re
-from typing import Dict, Any, List
-from tools import TOOL_DEFINITIONS, TOOL_MAP, search_product_catalog, submit_support_ticket
+import os
+from typing import Dict, Any, List, Optional
+from tools import TOOL_DEFINITIONS, TOOL_MAP, search_product_catalog, submit_support_ticket, validate_tool_call
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TODO 1: Thiết kế SYSTEM PROMPT cấp sản xuất
@@ -18,7 +19,6 @@ from tools import TOOL_DEFINITIONS, TOOL_MAP, search_product_catalog, submit_sup
 # ═══════════════════════════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = """
-
 Bạn là VinAssistant — trợ lý AI chính thức của hệ sinh thái Vingroup.
 
 ## 1. PERSONA
@@ -63,18 +63,49 @@ class ChatbotBaseline:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CLASS: ToolCallingAgent
+# CLASS: ToolCallingAgent (Optimized Engine with Schema Validation & Live Support)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ToolCallingAgent:
-    """Agent với System Prompt Engineering & Tool Calling."""
+    """Agent với System Prompt Engineering & Tool Calling Engine tối ưu."""
 
-    def __init__(self, max_iterations: int = 5):
+    def __init__(self, max_iterations: int = 5, use_live_api: bool = False):
         self.max_iterations = max_iterations
+        self.system_prompt = SYSTEM_PROMPT
+        self.tools = TOOL_DEFINITIONS
+        self.tool_map = TOOL_MAP
+        self.use_live_api = use_live_api and bool(os.getenv("GEMINI_API_KEY"))
         self.trace: List[Dict[str, Any]] = []
 
+    def _parse_price_vnd(self, text: str) -> int:
+        """Trích xuất và chuẩn hóa mức giá VNĐ linh hoạt từ văn bản tự nhiên."""
+        # Bắt các định dạng: 'dưới 600 triệu', 'dưới 600tr', 'dưới 1 tỷ', '< 600.000.000'
+        price_patterns = [
+            r"(?:dưới|<|không quá|tối đa|tầm)\s*([\d\.,]+)\s*(tỷ|ty|triệu|tr|nghìn|k|b|m|vnd|đ)?",
+            r"([\d\.,]+)\s*(tỷ|ty|triệu|tr|nghìn|k|b|m)\b"
+        ]
+        
+        for pat in price_patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                amount_str = m.group(1).replace(",", "").replace(".", "")
+                unit = (m.group(2) or "").lower()
+                try:
+                    amount = float(amount_str)
+                    if any(u in unit for u in ["tỷ", "ty", "b"]):
+                        return int(amount * 1_000_000_000)
+                    elif any(u in unit for u in ["triệu", "tr", "m"]) or amount < 10000:
+                        return int(amount * 1_000_000)
+                    elif any(u in unit for u in ["nghìn", "k"]):
+                        return int(amount * 1_000)
+                    else:
+                        return int(amount)
+                except ValueError:
+                    continue
+        return 999999999999
+
     def _detect_intent(self, user_input: str) -> Dict[str, Any]:
-        """Phân tích intent và tham số từ user_input."""
+        """Phân tích intent và trích xuất tham số tự nhiên từ user_input."""
         text = user_input.lower()
         
         needs_catalog = False
@@ -85,59 +116,48 @@ class ToolCallingAgent:
         
         is_faq = False
 
-        # 1. Catalog intent
-        has_car = bool(re.search(r"\b(xe|ô tô|oto|car|vf\s*\d*|bán tải)\b", text, re.IGNORECASE))
-        has_travel = bool(re.search(r"\b(resort|nghỉ dưỡng|du lịch|vinpearl|khách sạn|tour|phòng)\b", text, re.IGNORECASE))
+        # 1. Phát hiện Intent tra cứu Catalog (xe điện / du lịch)
+        has_car = bool(re.search(r"\b(xe|ô tô|oto|car|vf\s*\d*|bán tải|mini)\b", text, re.IGNORECASE))
+        has_travel = bool(re.search(r"\b(resort|nghỉ dưỡng|du lịch|vinpearl|khách sạn|tour|phòng|villa)\b", text, re.IGNORECASE))
         
-        if (has_car or has_travel) and any(w in text for w in ["xem", "tìm", "giá", "dưới", "triệu", "tỷ", "có xe", "có phòng"]):
+        has_search_kw = any(w in text for w in ["xem", "tìm", "giá", "dưới", "triệu", "tỷ", "có xe", "có phòng", "cho tôi"])
+        if (has_car or has_travel) and has_search_kw:
             needs_catalog = True
             category = "xe_dien" if has_car else "du_lich"
             catalog_args["category"] = category
-            
-            price_match = re.search(r"dưới\s*([\d\.,]+)\s*(triệu|tr|tỷ|ty|vnd|đ|b|m)?", text)
-            if price_match:
-                amount_str = price_match.group(1).replace(",", "").replace(".", "")
-                unit = price_match.group(2) or ""
-                try:
-                    amount = float(amount_str)
-                    if any(u in unit for u in ["tỷ", "ty", "b"]):
-                        max_price = int(amount * 1_000_000_000)
-                    elif any(u in unit for u in ["triệu", "tr", "m"]) or amount < 10000:
-                        max_price = int(amount * 1_000_000)
-                    else:
-                        max_price = int(amount)
-                    catalog_args["max_price"] = max_price
-                except ValueError:
-                    catalog_args["max_price"] = 999999999999
-            else:
-                catalog_args["max_price"] = 999999999999
+            catalog_args["max_price"] = self._parse_price_vnd(text)
 
-        # 2. Support ticket intent
+        # 2. Phát hiện Intent gửi phiếu hỗ trợ (Support Ticket)
         ticket_keywords = [
             "lỗi", "hỏng", "sự cố", "khiếu nại", "phản hồi", "hỗ trợ",
             "bị lỗi", "nghiêm trọng", "cần xử lý gấp", "ticket", "ghi nhận phản hồi", "ẩm mốc"
         ]
-        if any(kw in text for kw in ticket_keywords) and ("tên" in text or "tôi tên" in text or "phản hồi" in text):
+        if any(kw in text for kw in ticket_keywords) and any(w in text for w in ["tên", "tôi tên", "phản hồi", "gặp"]):
             needs_ticket = True
+            
+            # Trích xuất tên khách hàng
             name_match = re.search(r"(?:tên tôi là|tôi tên(?: là)?)\s+([A-ZÀ-Ỹa-zà-ỹ\s]+?)(?:,|\.|\bvà\b|$)", user_input, re.IGNORECASE)
             ticket_args["customer_name"] = name_match.group(1).strip() if name_match else "Khách hàng Vingroup"
             
-            priority = "medium"
+            # Trích xuất mức độ ưu tiên
             if any(p in text for p in ["nghiêm trọng", "gấp", "khẩn cấp", "high"]):
                 priority = "high"
             elif any(p in text for p in ["thấp", "low"]):
                 priority = "low"
+            else:
+                priority = "medium"
             ticket_args["priority"] = priority
 
+            # Trích xuất mô tả sự cố
             issue_desc = user_input
             desc_match = re.search(r"(?:xe\s+[A-Za-z0-9\s]+bị[^\.,]+|phòng[^\.,]+bị[^\.,]+|bị lỗi[^\.,]+)", user_input, re.IGNORECASE)
             if desc_match:
                 issue_desc = desc_match.group(0).strip()
             ticket_args["issue_description"] = issue_desc
 
-        # 3. FAQ intent
+        # 3. Phát hiện Intent FAQ (Hỏi chính sách không cần gọi tool)
         if not needs_catalog and not needs_ticket:
-            if any(w in text for w in ["bảo hành", "chính sách", "ở đâu", "bao lâu", "mấy năm"]):
+            if any(w in text for w in ["bảo hành", "chính sách", "ở đâu", "bao lâu", "mấy năm", "thời hạn"]):
                 is_faq = True
 
         return {
@@ -147,6 +167,21 @@ class ToolCallingAgent:
             "ticket_args": ticket_args,
             "is_faq": is_faq
         }
+
+    def _execute_validated_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
+        """Thực thi tool có kèm kiểm tra Schema & xử lý ngoại lệ an toàn."""
+        is_valid, err_msg = validate_tool_call(tool_name, args)
+        if not is_valid:
+            return {"error": f"Schema Validation Failed: {err_msg}"}
+
+        func = self.tool_map.get(tool_name)
+        if not func:
+            return {"error": f"Tool '{tool_name}' không tồn tại."}
+
+        try:
+            return func(**args)
+        except Exception as e:
+            return {"error": f"Lỗi khi thực thi công cụ {tool_name}: {str(e)}"}
 
     def run(self, user_input: str) -> Dict[str, Any]:
         """Điểm vào chính — chạy Agent Loop."""
@@ -184,9 +219,8 @@ class ToolCallingAgent:
         if intents["needs_catalog"]:
             tool_iterations += 1
             cat_args = intents["catalog_args"]
-            cat_func = TOOL_MAP["search_product_catalog"]
-            catalog_results = cat_func(**cat_args)
-            observations["catalog"] = catalog_results
+            cat_result = self._execute_validated_tool("search_product_catalog", cat_args)
+            observations["catalog"] = cat_result
 
             thought_msg = (
                 f"Khách hàng muốn tìm sản phẩm thuộc danh mục '{cat_args.get('category')}'. "
@@ -199,7 +233,7 @@ class ToolCallingAgent:
                     "name": "search_product_catalog",
                     "args": cat_args
                 },
-                "observation": catalog_results
+                "observation": cat_result
             })
             iteration += 1
 
@@ -207,8 +241,7 @@ class ToolCallingAgent:
         if intents["needs_ticket"]:
             tool_iterations += 1
             ticket_args = intents["ticket_args"]
-            ticket_func = TOOL_MAP["submit_support_ticket"]
-            ticket_result = ticket_func(**ticket_args)
+            ticket_result = self._execute_validated_tool("submit_support_ticket", ticket_args)
             observations["ticket"] = ticket_result
 
             thought_msg = (
@@ -226,7 +259,7 @@ class ToolCallingAgent:
             })
             iteration += 1
 
-        # Iteration 3+: Tổng hợp Final Answer từ trace
+        # Fallback: Không nhận diện được tác vụ
         if not observations:
             fallback_answer = "Rất tiếc, không tìm thấy sản phẩm nào phù hợp với yêu cầu của quý khách."
             self.trace.append({
@@ -241,23 +274,30 @@ class ToolCallingAgent:
                 "status": "completed"
             }
 
+        # Iteration 3+: Tổng hợp Final Answer từ trace
         answer_parts = []
         if "catalog" in observations:
             products = observations["catalog"]
-            if not products:
-                answer_parts.append("Rất tiếc, không tìm thấy sản phẩm nào phù hợp với yêu cầu của quý khách.")
-            else:
-                cat_lines = [f"- {p['name']}: Giá {p['price_vnd']:,} VNĐ" for p in products]
-                answer_parts.append(
-                    "Dưới đây là các sản phẩm phù hợp với yêu cầu của quý khách:\n" + "\n".join(cat_lines)
-                )
+            if isinstance(products, list):
+                if not products:
+                    answer_parts.append("Rất tiếc, không tìm thấy sản phẩm nào phù hợp với yêu cầu của quý khách.")
+                else:
+                    cat_lines = [f"- {p['name']}: Giá {p['price_vnd']:,} VNĐ" for p in products]
+                    answer_parts.append(
+                        "Dưới đây là các sản phẩm phù hợp với yêu cầu của quý khách:\n" + "\n".join(cat_lines)
+                    )
+            elif isinstance(products, dict) and "error" in products:
+                answer_parts.append(f"Lỗi khi tra cứu danh mục: {products['error']}")
 
         if "ticket" in observations:
             t = observations["ticket"]
-            answer_parts.append(
-                f"Yêu cầu hỗ trợ của khách hàng {t['customer_name']} đã được ghi nhận thành công "
-                f"với mã phiếu {t['ticket_id']} (Mức độ ưu tiên: {t['priority']})."
-            )
+            if isinstance(t, dict) and "ticket_id" in t:
+                answer_parts.append(
+                    f"Yêu cầu hỗ trợ của khách hàng {t['customer_name']} đã được ghi nhận thành công "
+                    f"với mã phiếu {t['ticket_id']} (Mức độ ưu tiên: {t['priority']})."
+                )
+            elif isinstance(t, dict) and "error" in t:
+                answer_parts.append(f"Lỗi khi ghi nhận phiếu: {t['error']}")
 
         final_answer = "\n\n".join(answer_parts)
         self.trace.append({
